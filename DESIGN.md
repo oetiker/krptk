@@ -60,8 +60,9 @@ No emails, no passwords, no server-side password database.
   ```
 
 - Blobs are encrypted with `appKey(appId)` using XChaCha20-Poly1305 (random
-  24-byte nonce per blob; libsodium.js or @noble — WebCrypto's AES-GCM is a
-  workable fallback where bundle size matters more than nonce comfort).
+  24-byte nonce per blob). All crypto lives in the shared Rust core and runs
+  in the browser as WASM — see
+  [Implementation](#implementation-pure-rust-one-workspace).
 - The server only ever sees the **public** identity key. It identifies a user
   as `userId = base58(sha256(pubkey))`.
 
@@ -133,9 +134,10 @@ GET    /v1/account                       → usage, quota, app list
 DELETE /v1/account                       (signed; full erasure)
 ```
 
-Admin (separate socket/path, operator-only): list accounts by usage, adjust
-quotas, mint invite codes, freeze/delete accounts. The admin sees sizes and
-timestamps, never plaintext.
+Admin endpoints live on a separate listener and back the
+[management UI](#management-ui): list accounts by usage, adjust quotas, mint
+invite codes, freeze/delete accounts. The admin sees sizes and timestamps,
+never plaintext.
 
 ## Abuse protection
 
@@ -175,25 +177,99 @@ an operator who wants an expiry policy (e.g. purge accounts untouched for
 3 years after email-less best-effort warning via the app) can opt in, but the
 promise to users should be the strong one.
 
-## Server implementation
+## Implementation: pure Rust, one workspace
 
-- **Go, single static binary** (Rust is fine too; Go wins on boring
-  deployability). One YAML config file. Official Docker image; runs happily
-  behind Caddy/nginx/Traefik for TLS.
-- **SQLite** for all metadata (accounts, quotas, versions, cursors, invite
-  codes) in WAL mode. Blobs ≤ ~64 KB inline in SQLite; larger ones as files
-  in a content-addressed directory. One server easily handles thousands of
-  users on a small VPS — these are sync workloads, not streaming.
+Everything — server, client core, admin UI — is Rust. The trick that makes
+this pay off is a shared core crate: the crypto and sync logic is written
+once and used natively on the server (for tests and the CLI) and compiled to
+WASM for the browser SDK.
+
+```
+krptk/                        # cargo workspace
+  crates/
+    krptk-core/    # key derivation, encryption, chunking, sync/CAS types,
+                   #   wire formats — pure logic, wasm32-compatible, no I/O
+    krptk-server/  # axum service: API + embedded admin UI + subcommands
+    krptk-wasm/    # wasm-bindgen bindings over krptk-core
+  sdk/             # thin TS wrapper published as @krptk/client
+```
+
+### Server (`krptk-server`)
+
+- **axum + tokio + tower**; rate limiting and body limits as tower layers
+  (`tower_governor` for token buckets per identity and per IP).
+- **SQLite via sqlx** (compile-time checked queries) in WAL mode for all
+  metadata: accounts, quotas, versions, cursors, invite codes, audit log.
+  Blobs ≤ ~64 KB inline in SQLite; larger ones as files in a
+  content-addressed directory (BLAKE3 names double as checksums).
+- **Crypto (RustCrypto/dalek ecosystem)**: `ed25519-dalek` for identity,
+  `chacha20poly1305` (XChaCha) for content, `hkdf` + `sha2` for derivation,
+  `bip39` for recovery phrases, `blake3` for content addressing. The same
+  crates run in WASM — one implementation, no JS crypto to keep in lockstep.
+- **One binary, subcommands**: `krptk serve`, `krptk admin …` (over a Unix
+  socket), `krptk backup` / `restore` (SQLite online-backup API + blob dir),
+  `krptk scrub` (verify checksums). TOML config, `tracing` structured logs,
+  Prometheus via `metrics-exporter-prometheus`.
+- Static musl build → a single self-contained artifact; Docker image is
+  `FROM scratch` + binary. Runs behind Caddy/nginx/Traefik for TLS.
 - **Durability** ("permanent" is a durability claim, not just a policy one):
-  SQLite WAL + fsync on write; first-class support for continuous offsite
-  backup via Litestream and an `krptk backup`/`restore` command for the blob
-  dir. Checksums on every blob, verified on read and by a scrubbing job.
-- Prometheus `/metrics`, structured logs, `krptk admin` CLI over a Unix
-  socket.
+  WAL + fsync on write, checksums verified on read and by the scrub job,
+  documented offsite backup recipe (built-in snapshot + rclone/restic; the
+  SQLite file also remains Litestream-compatible if the operator prefers).
+
+## Management UI
+
+Operator-facing, and planned in from the start rather than bolted on. It is
+**served by the same binary** (templates and assets embedded via
+`rust-embed`) so deployment stays "one binary, one config file".
+
+**Scope** (all metadata-only — the operator never sees plaintext):
+
+- **Dashboard**: total storage, account count, requests/day, top accounts by
+  usage, quota pressure, backup and scrub status.
+- **Accounts**: search by user id, per-app usage breakdown (sizes and
+  timestamps only), quota overrides, freeze / unfreeze, delete with
+  confirmation.
+- **Invites**: mint single- or multi-use codes with quota presets, see
+  redemption status, revoke unused codes.
+- **App registry**: add/edit `appId`s, CORS origins, per-app default quotas,
+  per-app usage stats.
+- **Settings**: registration mode (invite-only / open+PoW), PoW difficulty,
+  size and rate limits — the knobs from [Abuse protection](#abuse-protection).
+- **Audit log**: every admin action, who/when/what, append-only.
+
+**Tech**: server-side rendered with **askama** templates plus small amounts
+of vanilla JS for interactivity — an admin UI is tables and forms, and SSR
+keeps it dependency-light, fast, and testable with plain HTTP tests. If it
+ever outgrows that, `krptk-core` types are already shared, so promoting it
+to a Leptos/Dioxus WASM app later is an incremental change, not a rewrite.
+
+**Admin auth, deliberately separate from user auth**: operator accounts with
+argon2id-hashed passwords (created via `krptk admin add-operator`), optional
+TOTP second factor, session cookies (SameSite=Strict). By default the admin
+UI binds to a **separate listener** (e.g. localhost or an internal port) so
+operators can keep it off the public internet entirely or put it behind
+reverse-proxy auth (mTLS, OIDC) without touching krptk itself. All admin
+actions land in the audit log.
 
 ## Client SDK
 
-A small TypeScript package (`@krptk/client`, no framework dependency):
+The browser SDK is `krptk-core` compiled to WASM, wrapped in a thin
+TypeScript layer (`@krptk/client`). Division of labor:
+
+- **WASM (Rust)**: key derivation, encryption/decryption, recovery-phrase
+  handling, chunking, CAS/merge bookkeeping — everything with correctness or
+  security weight. Expect ~150–250 KB gzipped; acceptable for PWAs that
+  cache aggressively anyway.
+- **TypeScript**: the browser-flavored I/O — `fetch`, IndexedDB (offline
+  queue and key storage), `EventSource` for SSE, and the UI building blocks
+  (recovery-phrase onboarding, device linking). Keeping I/O out of WASM
+  avoids async-plumbing pain and keeps the WASM small and portable.
+
+A welcome side effect of the shared core: native Rust clients (a CLI, Tauri
+apps, tests that hammer the server) come almost for free.
+
+App-facing API surface (unchanged by the WASM internals):
 
 ```ts
 const store = await krptk.open({
@@ -228,14 +304,17 @@ any number of otherwise-serverless PWAs.**
 
 ## Roadmap sketch
 
-- **v0**: server (register/auth/KV/CAS/quotas/invite codes) + SDK
-  (keys, crypto, put/get, offline queue) + Docker image. Enough to ship one
-  real PWA on it.
-- **v1**: change feed + SSE, chunking, recovery-phrase UI kit, admin CLI,
-  Litestream docs, scrubbing.
+- **v0**: workspace scaffold; `krptk-core` (derivation, encryption, wire
+  types) with wasm build; server with register/auth/KV/CAS/quotas/invite
+  codes; `krptk admin` CLI (no UI yet); SDK with keys, crypto, put/get,
+  offline queue; Docker image. Enough to ship one real PWA on it.
+- **v1**: change feed + SSE, chunking, recovery-phrase UI kit,
+  **management UI** (dashboard, accounts, invites, app registry, settings,
+  audit log), backup/scrub commands and docs.
 - **v2 (only if needed)**: sharing between users (wrap a record key to
   another identity's public key), device-linking via QR, per-app server-side
-  webhooks, S3-compatible blob backend for bigger installs.
+  webhooks, S3-compatible blob backend for bigger installs, TOTP for
+  operators, Leptos/Dioxus admin SPA if the SSR UI outgrows itself.
 
 ## Open questions
 
@@ -251,3 +330,10 @@ any number of otherwise-serverless PWAs.**
 4. **Multi-tenancy**: one krptk instance for all your apps and all their
    users, or per-community instances? The design supports both; quotas and
    invite policy are where they differ.
+5. **Admin UI exposure**: is a localhost-only listener plus SSH tunnel enough
+   for your deployments, or does the UI need to be publicly reachable with
+   its own login (→ TOTP earlier in the roadmap)?
+6. **WASM bundle size**: is ~200 KB gzipped fine for all your apps, or does
+   some very small PWA need a JS-only crypto path? (I'd rather not maintain
+   two implementations — the shared core is the main reason the Rust stack
+   pays off.)
