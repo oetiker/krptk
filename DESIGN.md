@@ -65,18 +65,31 @@ No emails, no passwords, no server-side password database.
   appKey(app) = HKDF(seed, "krptk/v1/app/" + appId)      # symmetric, one per app
   ```
 
-- Blobs are encrypted with **AES-256-GCM** under a per-record subkey:
+- Blobs are encrypted with **AES-256-GCM under a random per-write content
+  key**, which is then wrapped by the app key:
 
   ```
-  recordKey = HKDF(appKey, "krptk/v1/rec/" + key)   # one subkey per record
-  ciphertext = AES-256-GCM(recordKey, nonce = 0, plaintext, aad = key‖version)
+  contentKey = random 256 bits                   # fresh on every write
+  wrapped    = AES-KW(HKDF(appKey, "krptk/v1/wrap"), contentKey)
+  ciphertext = AES-256-GCM(contentKey, nonce = 0, plaintext, aad = header)
+  record     = header ‖ wrapped ‖ ciphertext
   ```
 
-  Deriving a fresh subkey per record means the nonce never has to be unique
-  across records — it can be a constant — which removes the classic
-  nonce-reuse footgun entirely. The record key and version go in the AAD, so
-  ciphertext can't be replayed under a different key or rolled back to an
-  older version undetected.
+  A fresh key per write means the nonce never repeats under a given key, so
+  it can be a constant — the classic AES-GCM nonce-reuse footgun disappears.
+  The header (format version, algorithm ids, key name, record version, chunk
+  info) is authenticated as AAD, so ciphertext can't be replayed under a
+  different key or silently rolled back to an older version.
+
+  **Why wrapping rather than deriving the key from the key name** — this is
+  the one decision that must be right on day one. Deriving
+  `HKDF(appKey, name)` is simpler, but it welds every record to the app key
+  forever: sharing a single record with another user would mean handing over
+  the app key, and rotating the app key would mean re-encrypting every byte
+  the user owns. With a wrapped content key, sharing is *rewrapping one small
+  key* to a recipient's public key, and rotation rewraps headers without
+  touching content. Same cost today, and it's the difference between v2
+  features being additive or being a migration.
 - The server only ever sees the **public** identity key. It identifies a user
   as `userId = base58(sha256(pubkey))`.
 
@@ -113,19 +126,23 @@ compiled to WASM. Three reasons, in order of importance:
 
 Everything the design needs is available: `HKDF` for derivation, `PBKDF2`
 with SHA-512 for the BIP39 seed step (2048 iterations, exactly as BIP39
-specifies), `AES-GCM` for content, and `Ed25519` for identity signatures
-(shipped in all major browsers by 2025; a small WASM fallback covers older
-ones). Only the BIP39 *wordlist* mapping is plain non-secret code.
+specifies), `AES-GCM` for content, `AES-KW` for key wrapping, `X25519` for
+rewrapping a content key to another user (the sharing path), and `Ed25519`
+for identity signatures — the last two shipped in all major browsers by 2025,
+with a small WASM fallback for older ones. Only the BIP39 *wordlist* mapping
+is plain non-secret code.
 
 The chain is designed so raw key bytes never need to persist: the seed is
-imported as non-extractable HKDF key material, and app and record keys are
-derived from it as non-extractable AES keys.
+imported as non-extractable HKDF key material, app keys are derived from it as
+non-extractable, and `unwrapKey` turns a stored wrapped key into a
+non-extractable content key — so no key in the chain is ever readable by
+script.
 
 **The honest tradeoffs:**
 
-- **XChaCha20-Poly1305 is out** — WebCrypto doesn't offer it. AES-GCM with
-  per-record subkeys is an equally sound choice, and the derivation trick
-  above neutralizes AES-GCM's short-nonce weakness.
+- **XChaCha20-Poly1305 is out** — WebCrypto doesn't offer it. AES-GCM with a
+  fresh per-write content key is an equally sound choice, and it neutralizes
+  AES-GCM's short-nonce weakness.
 - **The recovery phrase becomes show-once.** If the seed is never persisted
   in extractable form, the app cannot re-display the phrase later. That's a
   real UX cost, and the mitigation is either accepting it (show it at
@@ -157,8 +174,10 @@ replaying a login against another krptk instance.
 The primitive is a **versioned KV store with compare-and-swap and a change
 feed** — deliberately *not* a full sync engine, so the server stays generic:
 
-- Namespace: `user / app / key` (keys are client-chosen strings, typically
-  encrypted or hashed names so the server learns nothing from them).
+- Namespace: `user / app / key`, where key names are **required to be opaque
+  fixed-length hashes** (hashed per path segment, so prefix queries still
+  work) — see
+  [Can the server refuse unencrypted records?](#can-the-server-refuse-unencrypted-records).
 - Every record has a monotonically increasing per-`(user,app)` **revision**.
 - Writes are CAS: `PUT … If-Version: N` fails with `409` if someone else
   (another device) wrote in between. The client then reads, merges, retries.
@@ -197,6 +216,60 @@ Admin endpoints live on a separate listener and back the
 [management UI](#management-ui): list accounts by usage, adjust quotas, mint
 invite codes, freeze/delete accounts. The admin sees sizes and timestamps,
 never plaintext.
+
+## Can the server refuse unencrypted records?
+
+Partly — and the part it *can* do is more valuable than it first looks, as
+long as we're precise about what is being defended against.
+
+**What the server cannot do**: prove that a blob is "properly encrypted".
+Ciphertext is indistinguishable from random by design, and a determined client
+can always produce high-entropy bytes that are effectively plaintext — encrypt
+under a published key, or simply encode data as random-looking bytes. Any
+endpoint that accepts opaque bytes can be misused to store arbitrary content
+by whoever controls the client. No server-side check fixes that, and a scheme
+that tried (zero-knowledge proofs of correct key derivation) would cost more
+than the entire rest of this design. **Against a malicious client, E2E is
+enforced by the client, not the server.**
+
+**What the server can do — enforce the zero-knowledge invariant against
+bugs**, which is the failure mode that actually happens. A misconfigured
+adapter, a debug build with encryption disabled, a hand-rolled `curl` in a
+test script: all of these silently ship plaintext to a server that promised
+never to hold it. Three cheap, fully implementable checks:
+
+1. **Structural validation.** Every record must carry a well-formed krptk
+   header: magic bytes, format version, algorithm ids, wrapped-key length,
+   plausible chunk metadata, and a body whose length matches the AEAD tag
+   overhead. Malformed → `422`. This alone catches essentially every
+   accidental-plaintext bug, because plaintext JSON does not begin with the
+   krptk magic.
+2. **Entropy check on the body.** Ciphertext is incompressible and
+   near-uniform. Sampling the first few KB and rejecting bodies that compress
+   well or fail a chi-square test costs microseconds and catches the case
+   where someone fabricates a valid header around plaintext. False positives
+   are essentially impossible for real ciphertext.
+3. **Opaque key names, enforced.** This one closes a leak the other two
+   don't. If key names are app-chosen strings, `notes/divorce-lawyer.md`
+   leaks plaintext to the server *even though the value is encrypted*. So the
+   server **requires key names to be fixed-length hashes**, rejecting anything
+   else. The SDK hashes **per path segment** — `H(seg1)/H(seg2)/…` — so
+   prefix queries, pinning and prefetch (`recent/*`) still work while the
+   names themselves carry nothing. What remains visible is structure and
+   shape: how many records, how big, how deep the hierarchy, when they change.
+   That's the irreducible metadata of any sync server, and it belongs in the
+   threat model, stated rather than glossed over.
+
+Enforcement is a **per-app policy flag** in the app registry
+(`require_encrypted: true`, on by default), so an operator can run a lax app
+knowingly, and a strict one gets a hard `422` the moment a bug tries to leak.
+The management UI surfaces rejection counts — a spike is exactly the signal
+that someone shipped a broken client.
+
+Worth being clear about the security value: these checks protect **users from
+their app's bugs** and **the operator from unknowingly holding personal data**.
+They are not an anti-abuse mechanism — quotas and gated registration do that
+job, and they don't depend on the contents being encrypted at all.
 
 ## Abuse protection
 
@@ -652,23 +725,59 @@ The niche krptk fills: **one tiny zero-knowledge server that transparently
 backs up and syncs the browser storage any number of otherwise-serverless
 PWAs already use.**
 
-## Roadmap sketch
+## What must be designed now vs. built now
 
-- **v0**: workspace scaffold; `krptk-format` + `krptk-crypto` with test
-  vectors; server with register/auth/KV/CAS/quotas/invite codes; `krptk admin`
-  CLI (no UI yet); SDK with WebCrypto key handling, outbox, and the
+"Why not just build the whole thing?" is the right question to ask of any
+phased plan, and the answer isn't the same for every part. The distinction
+that matters is **format vs. code**:
+
+- Anything that touches the **wire format, crypto format, key names, or the
+  server's data model is designed and specified in full now**, even where it
+  isn't implemented. Retrofitting these means migrating users' encrypted data
+  — the one migration a zero-knowledge store handles badly, because the
+  server can't rewrite anything on the users' behalf. Every client would have
+  to re-upload everything it owns, from a device that still has the keys.
+- Anything **additive in code** — another adapter, another admin screen —
+  can wait, because adding it later costs the same as adding it now.
+
+Concretely, these must be right in the v1 format, and are:
+
+| Decision | Why it can't be retrofitted |
+|---|---|
+| Wrapped random content keys | Sharing and key rotation are impossible if keys are derived from the app key — see [Identity and keys](#identity-and-keys) |
+| Record header: format version + algorithm ids | Without a version byte there is no way to *ever* change anything else |
+| Opaque hashed key names, hashed per segment | Key names are chosen at write time; changing the scheme renames every record |
+| Chunking layout for large values | Determines whether range reads and the cache adapter are possible at all |
+| Change feed returning key + version + size | The cache adapter's local index is built from this; adding fields later is fine, changing semantics is not |
+| Tombstones and cursor semantics | Convergence rules can't change under live clients |
+| One PVC holding database + blobs | A snapshot-atomicity requirement, not a preference |
+
+Note what that table implies: the cache adapter and user-to-user sharing are
+*late implementation items but early format items*. They're in the format
+from day one precisely so they can be added later without a migration.
+
+The reason not to implement everything before shipping is not caution about
+scope — it's that a design like this is validated by one real PWA running on
+it. Adapters built before any app needs them are guesses; the change feed's
+ergonomics only become clear once a second device is syncing. So:
+
+- **Milestone 1 — format frozen, thin vertical slice.** `krptk-format` and
+  `krptk-crypto` complete with test vectors; server with
+  register/auth/KV/CAS/quotas/invite codes and the encryption-invariant
+  checks; `krptk admin` CLI; SDK with WebCrypto key handling, outbox, and the
   `localStorage` + `idb-keyval` adapters; Helm chart and scratch image.
-  Enough to ship one real PWA on it.
-- **v1**: change feed + SSE, batching and chunking, service-worker sync with
-  Background Sync, Dexie adapter, recovery-phrase and sync-status UI kit,
-  **management UI** (dashboard, accounts, invites, app registry, settings,
-  audit log), `quiesce` + scheduled scrub, snapshot/restore runbook, and
-  `krptk backup`/`restore` logical archives.
-- **v2 (only if needed)**: cache adapter (tiered working set + local index)
-  for datasets bigger than browser quota, sharing between users (wrap a record key to another identity's public key),
-  device-linking via QR, OPFS/Cache file sync, TOTP for operators,
-  Postgres + S3 backend for multi-replica installs, Leptos/Dioxus admin SPA
-  if the SSR UI outgrows itself.
+  One of your PWAs runs on it for real.
+- **Milestone 2 — make it operable and pleasant.** Change feed + SSE,
+  batching and chunking, service-worker background sync, Dexie adapter,
+  recovery-phrase and sync-status UI kit, management UI, `quiesce` +
+  scheduled scrub, snapshot/restore runbook, logical `backup`/`restore`.
+- **Milestone 3 — the capabilities the format already anticipates.** Cache
+  adapter with local index, user-to-user sharing by rewrapping content keys,
+  QR device linking, OPFS/Cache file sync, TOTP for operators, and — only if
+  a real install demands it — the Postgres + S3 multi-replica backend.
+
+If a milestone-3 item turns out to be needed sooner, pulling it forward is
+just work, not redesign. That's the whole point of freezing the format first.
 
 ## Open questions
 
@@ -691,9 +800,13 @@ PWAs already use.**
    extractable key material), or do apps need PIN-protected re-display?
 7. **Which adapters first?** Ordering `localStorage`, `idb-keyval`, Dexie and
    raw IndexedDB depends on what your existing PWAs actually use — worth
-   listing them before v0.
-8. **Cache adapter timing**: does one of your apps need the
-   bigger-than-the-browser mode soon enough to pull it into v1, or is
-   full replication enough for now?
+   listing them before milestone 1.
+8. **Cache adapter timing**: it's in the format from day one either way —
+   does one of your apps need the bigger-than-the-browser mode implemented
+   early, or is full replication enough to start?
 9. **Storage class**: which block-backed RWO class does your cluster have?
    The chart's defaults and its refuse-RWX guard should match reality.
+10. **Sharing between users**: the format supports it (rewrap a content key to
+    a recipient's X25519 key), but the *UX* — how one user names another
+    without the server holding an address book — is unsolved, and it's worth
+    deciding before it gets built rather than after.
