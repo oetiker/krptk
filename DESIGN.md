@@ -14,6 +14,11 @@ The store must be:
 - **Permanent**: a user's data stays until *they* delete it.
 - **Abuse-resistant**: an internet-facing free storage endpoint is a magnet
   for bots and freeloaders; it must not become anyone's free file host.
+- **Never holding readable content**: as the operator you must not end up in
+  possession of user text or viewable images — a legal exposure question as
+  much as a privacy one. This is a hard requirement, and the server enforces
+  it rather than trusting clients; see
+  [Never storing cleartext](#never-storing-cleartext--the-operators-position).
 
 ## Core idea
 
@@ -177,7 +182,7 @@ feed** — deliberately *not* a full sync engine, so the server stays generic:
 - Namespace: `user / app / key`, where key names are **required to be opaque
   fixed-length hashes** (hashed per path segment, so prefix queries still
   work) — see
-  [Can the server refuse unencrypted records?](#can-the-server-refuse-unencrypted-records).
+  [Never storing cleartext](#never-storing-cleartext--the-operators-position).
 - Every record has a monotonically increasing per-`(user,app)` **revision**.
 - Writes are CAS: `PUT … If-Version: N` fails with `409` if someone else
   (another device) wrote in between. The client then reads, merges, retries.
@@ -217,59 +222,116 @@ Admin endpoints live on a separate listener and back the
 invite codes, freeze/delete accounts. The admin sees sizes and timestamps,
 never plaintext.
 
-## Can the server refuse unencrypted records?
+## Never storing cleartext — the operator's position
 
-Partly — and the part it *can* do is more valuable than it first looks, as
-long as we're precise about what is being defended against.
+The goal here is not cryptographic: it's that **you, running this box, are
+never in possession of readable user content** — no readable text, and in
+particular no viewable image. That is a much easier property to guarantee than
+"prove this blob is properly encrypted", and the server can enforce it
+essentially completely.
 
-**What the server cannot do**: prove that a blob is "properly encrypted".
-Ciphertext is indistinguishable from random by design, and a determined client
-can always produce high-entropy bytes that are effectively plaintext — encrypt
-under a published key, or simply encode data as random-looking bytes. Any
-endpoint that accepts opaque bytes can be misused to store arbitrary content
-by whoever controls the client. No server-side check fixes that, and a scheme
-that tried (zero-knowledge proofs of correct key derivation) would cost more
-than the entire rest of this design. **Against a malicious client, E2E is
-enforced by the client, not the server.**
+*(Design guidance, not legal advice — the specifics of hosting liability are
+jurisdiction-dependent and worth one conversation with a lawyer. What the
+design can do is give you the levers any regime expects: no cleartext, no
+ability to read, and a working takedown path.)*
 
-**What the server can do — enforce the zero-knowledge invariant against
-bugs**, which is the failure mode that actually happens. A misconfigured
-adapter, a debug build with encryption disabled, a hand-rolled `curl` in a
-test script: all of these silently ship plaintext to a server that promised
-never to hold it. Three cheap, fully implementable checks:
+### Rejecting cleartext is decidable in practice
 
-1. **Structural validation.** Every record must carry a well-formed krptk
-   header: magic bytes, format version, algorithm ids, wrapped-key length,
-   plausible chunk metadata, and a body whose length matches the AEAD tag
-   overhead. Malformed → `422`. This alone catches essentially every
-   accidental-plaintext bug, because plaintext JSON does not begin with the
-   krptk magic.
-2. **Entropy check on the body.** Ciphertext is incompressible and
-   near-uniform. Sampling the first few KB and rejecting bodies that compress
-   well or fail a chi-square test costs microseconds and catches the case
-   where someone fabricates a valid header around plaintext. False positives
-   are essentially impossible for real ciphertext.
-3. **Opaque key names, enforced.** This one closes a leak the other two
-   don't. If key names are app-chosen strings, `notes/divorce-lawyer.md`
-   leaks plaintext to the server *even though the value is encrypted*. So the
-   server **requires key names to be fixed-length hashes**, rejecting anything
-   else. The SDK hashes **per path segment** — `H(seg1)/H(seg2)/…` — so
-   prefix queries, pinning and prefetch (`recent/*`) still work while the
-   names themselves carry nothing. What remains visible is structure and
-   shape: how many records, how big, how deep the hierarchy, when they change.
-   That's the irreducible metadata of any sync server, and it belongs in the
-   threat model, stated rather than glossed over.
+The reason this works is that **cleartext isn't random** — and every format
+that could get you in trouble is trivially recognizable:
 
-Enforcement is a **per-app policy flag** in the app registry
-(`require_encrypted: true`, on by default), so an operator can run a lax app
-knowingly, and a strict one gets a hard `422` the moment a bug tries to leak.
-The management UI surfaces rejection counts — a spike is exactly the signal
-that someone shipped a broken client.
+- **Positive validation first.** A record is accepted only if it *is* a krptk
+  record: magic bytes, format version, algorithm ids, wrapped-key length,
+  chunk table consistency, body length matching AEAD tag overhead. This is an
+  allowlist, not a blocklist — a JPEG, a PNG, an HEIC, a PDF, an MP4 or a
+  plain UTF-8 string fails at the first byte. Nothing needs to be *detected*;
+  everything that isn't a krptk record is rejected by default.
+- **Entropy check on the body.** Ciphertext is incompressible and near-uniform.
+  Sampling a few KB and rejecting anything that compresses well or fails
+  chi-square costs microseconds, and catches the one remaining accident:
+  someone fabricating a valid header around real content. Encrypted data
+  passes this always; JPEG/PNG/text data fails it always.
+- **Known-format sniffing as a tripwire**, not a gate. Cheap magic-byte
+  matching against common media and document formats, purely so that a
+  rejection can be *logged as "an app tried to upload a JPEG"* rather than
+  "malformed record". That's the signal you actually want in the admin UI.
+- **Every chunk carries its own header.** Large values are chunked, and chunk
+  #7 of a photo must be a valid krptk chunk in its own right — otherwise the
+  invariant would hold for records but not for the bytes actually on disk.
+- **Opaque key names, enforced.** Values being encrypted isn't enough:
+  `photos/2019-ibiza/nude-01.jpg` as a key name puts readable content on your
+  disk. So the server requires fixed-length hashed names — hashed **per path
+  segment**, so `recent/*` prefix queries, pinning and prefetch still work
+  while the names carry nothing. What remains visible is shape: record counts,
+  sizes, hierarchy depth, change times. Irreducible for any sync server, and
+  stated here rather than glossed over.
 
-Worth being clear about the security value: these checks protect **users from
-their app's bugs** and **the operator from unknowingly holding personal data**.
-They are not an anti-abuse mechanism — quotas and gated registration do that
-job, and they don't depend on the contents being encrypted at all.
+Enforcement is a per-app flag (`require_encrypted: true`, **on by default**),
+returning a hard `422`. The management UI surfaces rejection counts and the
+tripwire categories, so a spike tells you immediately that some client shipped
+broken.
+
+### The server must never render what it stores
+
+A liability-shaped detail that has nothing to do with crypto: even under the
+invariant, the server should be structurally incapable of *serving* content as
+media. So every blob response is `Content-Type: application/octet-stream`
+regardless of anything the client claimed, plus
+`Content-Disposition: attachment`, `X-Content-Type-Options: nosniff` and a
+restrictive CSP. The server never stores or echoes a client-supplied content
+type, and does **no image processing whatsoever** — no thumbnailing, no
+dimension probing, no format conversion, because all of those require
+plaintext. Combined with there being no unauthenticated read path, the service
+cannot function as an image host even if something slipped past validation.
+
+App-side, the matching rule: **thumbnails and previews are content too.** A
+photo app that encrypts originals but caches plaintext thumbnails has defeated
+the whole exercise. The SDK's adapters treat derived media exactly like source
+media.
+
+### A continuously verified claim, not a promise
+
+"We never store cleartext" is worth much more if it's *checked*, so the scrub
+job does double duty: alongside verifying BLAKE3 checksums, it re-validates
+that **every stored record still parses as a krptk record and passes the
+entropy check**. Results go to a Prometheus metric and the admin UI. That
+turns the invariant from a statement about intent into a continuously audited
+property of the running system — which is exactly the kind of thing that is
+useful to be able to demonstrate after the fact.
+
+Worth writing down in the repo as a short transparency note (what is stored,
+what is verified, what the operator can and cannot see), since that document
+is what you'd hand to anyone asking.
+
+### What remains, and what actually protects you
+
+- **A determined user can still store illegal material — encrypted.** They'd
+  have to encrypt it, at which point you hold ciphertext, which is precisely
+  the position of every E2E service. The invariant means you cannot be found
+  holding a viewable file; it does not mean the underlying bytes are innocent.
+- **You cannot inspect, and that is the point.** Holding no keys means you
+  cannot proactively moderate — but it also means you cannot be expected to.
+  What matters is that you can still *act*: freeze or delete an account or a
+  record on notice, without reading anything.
+- **So the takedown path is a design feature, not paperwork.** An abuse
+  contact, an admin flow to freeze/purge an account, and an append-only audit
+  log of those actions. The ability to respond to notice is generally what
+  keeps a host in the "conduit, not publisher" position; being unable to read
+  content doesn't undermine that, but being unable to *act* would.
+- **Gated registration is a liability control too.** Invite-only means users
+  reach you through an identifiable chain rather than anonymously — you're a
+  private store for known people, not a public anonymous upload host. That's a
+  materially different posture, and it's another reason to keep invites the
+  default.
+- **Sharing changes the analysis — flag it now.** The moment user-to-user
+  sharing lands, the service starts to *distribute* rather than merely store,
+  which is a different legal question. So sharing stays off by default and
+  enabled per app, and that milestone deserves its own review rather than
+  being treated as a feature toggle.
+- **Log as little as possible, deliberately.** Metadata sufficient to answer a
+  lawful request (account creation time, quota usage, action audit) with short
+  retention. Extensive IP logging is itself a privacy liability; the default
+  should be minimal and documented.
 
 ## Abuse protection
 
@@ -301,8 +363,13 @@ Layered, cheapest defense first:
 5. **Blob/size/rate caps**: max blob size, max keys per app, bounded request
    body handling, global connection limits — standard hygiene.
 
-6. **Operator tools, not surveillance**: usage dashboards, top-accounts view,
-   freeze/purge — all metadata-only.
+6. **Cleartext refused at the door**: not an abuse control as such, but it is
+   what keeps the operator out of possession of readable content — see
+   [Never storing cleartext](#never-storing-cleartext--the-operators-position).
+
+7. **Operator tools, not surveillance**: usage dashboards, top-accounts view,
+   freeze/purge, abuse contact and takedown flow — all metadata-only, all
+   audit-logged.
 
 Explicitly **off by default**: inactivity expiry. "Permanent" means permanent;
 an operator who wants an expiry policy (e.g. purge accounts untouched for
@@ -361,7 +428,7 @@ fallback on older browsers, and nothing else. That drops the SDK from
   `FROM scratch` + binary, distroless-equivalent and scannable to nothing.
 - **Durability** ("permanent" is a durability claim, not just a policy one):
   WAL with `synchronous=FULL`, checksums verified on read and by the scheduled
-  scrub, a `quiesce` command so the volume can be snapshotted cleanly, and
+  scrub (which also re-validates the cleartext invariant), a `quiesce` command so the volume can be snapshotted cleanly, and
   `krptk backup`/`restore` for portable logical archives. Backups themselves
   are the cluster's job — see
   [Backup via Ceph RBD snapshots](#backup-and-restore-via-ceph-rbd-snapshots).
@@ -521,6 +588,11 @@ Operator-facing, and planned in from the start rather than bolted on. It is
   per-app usage stats.
 - **Settings**: registration mode (invite-only / open+PoW), PoW difficulty,
   size and rate limits — the knobs from [Abuse protection](#abuse-protection).
+- **Abuse handling**: notice intake, per-account and per-record freeze and
+  purge, and the resulting audit entries — the operator-facing half of
+  [never storing cleartext](#never-storing-cleartext--the-operators-position).
+- **Invariant health**: cleartext-rejection counts by category, last clean
+  scrub, snapshot age — the numbers that back the transparency note.
 - **Audit log**: every admin action, who/when/what, append-only.
 
 **Tech**: server-side rendered with **askama** templates plus small amounts
@@ -763,16 +835,20 @@ ergonomics only become clear once a second device is syncing. So:
 
 - **Milestone 1 — format frozen, thin vertical slice.** `krptk-format` and
   `krptk-crypto` complete with test vectors; server with
-  register/auth/KV/CAS/quotas/invite codes and the encryption-invariant
-  checks; `krptk admin` CLI; SDK with WebCrypto key handling, outbox, and the
+  register/auth/KV/CAS/quotas/invite codes, the cleartext-refusal invariant
+  (positive validation, entropy check, opaque key names, no-render response
+  headers); `krptk admin` CLI; SDK with WebCrypto key handling, outbox, and the
   `localStorage` + `idb-keyval` adapters; Helm chart and scratch image.
   One of your PWAs runs on it for real.
 - **Milestone 2 — make it operable and pleasant.** Change feed + SSE,
   batching and chunking, service-worker background sync, Dexie adapter,
   recovery-phrase and sync-status UI kit, management UI, `quiesce` +
-  scheduled scrub, snapshot/restore runbook, logical `backup`/`restore`.
+  scheduled scrub (checksums *and* cleartext-invariant re-validation),
+  snapshot/restore runbook, logical `backup`/`restore`, transparency note.
 - **Milestone 3 — the capabilities the format already anticipates.** Cache
-  adapter with local index, user-to-user sharing by rewrapping content keys,
+  adapter with local index, user-to-user sharing by rewrapping content keys
+  (off by default, per-app, and deserving its own liability review since it
+  turns storage into distribution),
   QR device linking, OPFS/Cache file sync, TOTP for operators, and — only if
   a real install demands it — the Postgres + S3 multi-replica backend.
 
@@ -810,3 +886,12 @@ just work, not redesign. That's the whole point of freezing the format first.
     a recipient's X25519 key), but the *UX* — how one user names another
     without the server holding an address book — is unsolved, and it's worth
     deciding before it gets built rather than after.
+11. **Legal review, once**: the cleartext invariant, the takedown flow and the
+    transparency note are the design's answer to operator exposure, but the
+    specifics (Swiss hosting-provider duties, what retention is expected, what
+    an abuse contact must look like) want a lawyer's read before the service
+    holds anyone else's data. Worth doing before milestone 1 ships publicly,
+    not after.
+12. **Management UI also needs an abuse workflow**, not just quotas: notice
+    intake, freeze, purge, and the audit trail as first-class screens. Should
+    that be in milestone 2 with the rest of the UI, or earlier?
