@@ -206,6 +206,8 @@ by the SDK. This keeps memory bounded and quotas honest.
 
 ```
 POST   /v1/register                      {pubkey, appId, pow, devSig?}
+POST   /v1/enroll/start                  {appId, email}  → sends code, TTL row
+POST   /v1/enroll/verify                 {pubkey, code}  → tier upgrade
 POST   /v1/auth/challenge                → {nonce}
 POST   /v1/auth/token                    {pubkey, signature} → {token, ttl}
 
@@ -383,6 +385,86 @@ software, they keep the users. The design supports both; this is a decision
 about appetite, not architecture, and it's easier to make now than after the
 first app has a thousand users.
 
+### Optional email enrollment
+
+Asking users to enroll with an email and keeping only a hash is a good
+instinct, and it fits the earned-quota model well — but two things need to be
+right, and the first one decides whether it does what you want at all.
+
+**A hash cannot be contacted.** If the server stores only `H(email)`, it can
+check uniqueness but can never send anything. So decide which goal is being
+bought:
+
+| Goal | Needs | Cost |
+|---|---|---|
+| Sybil resistance / dedup | peppered hash only | low — no address retained |
+| Notifying users (expiry warnings, security notices, "save your phrase") | the **address itself**, retained | real PII in the database, in every snapshot, and in every offsite copy |
+
+Those are different features. Storing addresses to enable warnings puts
+personal data into exactly the backups you were keeping clean; hash-only keeps
+the database boring but means you still cannot warn anyone before an empty
+account expires. My recommendation is **hash-only by default**, with address
+retention as a per-app opt-in for apps that genuinely want to notify their
+users — and when retained, encrypted under a key held outside the database so
+a snapshot alone doesn't disclose it.
+
+**A plain hash of an email is not anonymization.** The address space is small
+and enumerable; hashed email dumps get reversed routinely, and data-protection
+law treats a hashed identifier as *pseudonymous personal data*, still in
+scope — so "we only store a hash" doesn't remove the obligation, and doesn't
+protect users if the database leaks. The construction that does:
+
+```
+handle = HMAC-SHA256(serverPepper, normalize(email) ‖ appId)
+```
+
+- **A server-side pepper**, kept in a Secret *outside* the database and its
+  backups. Without it a leaked database can't be brute-forced; with a bare
+  SHA-256 it can, in minutes.
+- **Scoped per app.** Including `appId` means the same person enrolling in
+  three of your friends' apps produces three unlinkable handles — preserving
+  the per-app isolation the key hierarchy already gives, and making Sybil
+  resistance per-app, which is the right granularity anyway since pools are
+  per-app.
+- **Normalize before hashing** (lowercase, trim, and optionally strip
+  plus-addressing and Gmail dots — a policy choice that tightens dedup).
+- **The plaintext address is transient**: held only for the verification
+  round-trip in a short-TTL row, then discarded. The server sees it once; it
+  never lands in the durable set.
+- **Pepper rotation is lazy**: you can't re-hash addresses you no longer have,
+  so a rotation carries old and new handle columns and upgrades each account
+  the next time its owner verifies.
+
+**Where it fits: a quota tier, not a gate.** Forcing email verification on
+every app's onboarding is a heavy tax on a small PWA — the current flow is
+"generate keys, save phrase", and "enter email, wait for a code" is a real
+funnel step. So make it per-app policy and tie it to
+[earned quota](#abuse-protection): anonymous accounts get the small starter
+quota, email-verified accounts get a substantially larger one. Apps that need
+serious storage adopt enrollment because their users want the space; trivial
+apps stay frictionless. That converts email from a barrier into an incentive,
+and it targets exactly the abuse case, since bulk account creation is only
+worth doing if the accounts are worth something.
+
+**Two hard rules**, or the architecture unravels:
+
+1. **Email is never authentication.** Access comes from the keypair, always.
+   An email-based login would hand the server the ability to impersonate
+   users.
+2. **Email is never key recovery.** There is no way to recover data from an
+   address — the recovery phrase remains the only path. Users will assume
+   otherwise the moment they see an email field, so the enrollment UI has to
+   say so plainly, or email enrollment will actively *worsen* the number of
+   people who lose their data by making them feel safe.
+
+**The costs, stated:** running SMTP for a self-hosted service is a genuine
+operational burden (deliverability, SPF/DKIM, bounces, spam complaints);
+disposable-address domains make dedup a treadmill rather than a solution; and
+verification adds a step to onboarding that some apps won't want. Privacy
+Pass / Private Access Tokens are the emerging way to get anonymous rate
+limiting without any identifier at all, but support is uneven — worth watching
+rather than building on today.
+
 ## Abuse protection
 
 Layered, cheapest defense first:
@@ -406,6 +488,9 @@ Layered, cheapest defense first:
      genuine use. An abuser gets a fleet of near-useless accounts; a real
      user never notices. This is the single most effective knob, because it
      makes Sybil accounts worthless rather than merely costly.
+   - **Optional email enrollment as a quota tier** — verified accounts get
+     materially more space, anonymous ones stay small. See
+     [Optional email enrollment](#optional-email-enrollment).
    - **Optional developer-signed registration** for apps that *do* have a
      backend or their own invite system: the registry entry carries the
      developer's public key, and registrations must be signed by it. Not
@@ -440,7 +525,9 @@ policy splits:
 - **Empty accounts** (registered, never stored a record) expire after ~30
   days. No data is lost by definition, and this absorbs most of the noise.
 - **Accounts with data are permanent**, unless the operator opts into a
-  long-horizon policy knowingly.
+  long-horizon policy knowingly — and note that such a policy only becomes
+  defensible for apps that retain addresses, since otherwise there is nobody
+  to warn. See [Optional email enrollment](#optional-email-enrollment).
 
 That keeps the strong promise where it means something without accumulating
 unbounded debris from anonymous registration.
@@ -484,7 +571,7 @@ fallback on older browsers, and nothing else. That drops the SDK from
   across both.
 - **Crypto on the server is minimal**: `ed25519-dalek` to verify login
   signatures, `argon2` for operator passwords, `blake3` for content
-  addressing. Content ciphers live only in `krptk-crypto`, for native clients
+  addressing, `hmac` for peppered email handles if enrollment is enabled. Content ciphers live only in `krptk-crypto`, for native clients
   and for format conformance tests — the server never needs them.
 - **One binary, subcommands**: `krptk serve`, `krptk admin …`,
   `krptk backup` / `restore` (SQLite online-backup API + blob dir),
@@ -553,8 +640,10 @@ Consequences worth planning for rather than discovering:
   `RuntimeDefault`.
 - **Config and secrets**: TOML config from a ConfigMap with a checksum
   annotation so config changes roll the pod; session signing key, operator
-  bootstrap credentials and S3 backup credentials from a Secret (External
-  Secrets-friendly).
+  bootstrap credentials, SMTP credentials and the **email pepper** from a
+  Secret (External Secrets-friendly). The pepper must live outside the PVC so
+  that a leaked volume snapshot cannot be used to enumerate email handles —
+  which means it also needs its own backup, separate from the volume ones.
 - **Observability**: optional `ServiceMonitor` for Prometheus Operator, and
   the shipped dashboard/alerts should cover the things that actually bite —
   volume nearing full, backup age exceeding threshold, scrub errors, quota
@@ -659,9 +748,10 @@ Operator-facing, and planned in from the start rather than bolted on. It is
   writes, freeze everything).
 - **Accounts by provenance**: which app registered an account and when, so an
   abuse report resolves to an app and then to a person you can call.
-- **Settings**: PoW difficulty, earned-quota curve, per-IP and per-app
-  creation limits, size and rate limits, global storage ceiling — the knobs
-  from [Abuse protection](#abuse-protection).
+- **Settings**: PoW difficulty, earned-quota curve, anonymous vs. verified
+  quota tiers, per-IP and per-app creation limits, size and rate limits,
+  global storage ceiling — the knobs from
+  [Abuse protection](#abuse-protection).
 - **Abuse handling**: notice intake, per-account and per-record freeze and
   purge, and the resulting audit entries — the operator-facing half of
   [never storing cleartext](#never-storing-cleartext--the-operators-position).
@@ -915,7 +1005,9 @@ ergonomics only become clear once a second device is syncing. So:
   headers); `krptk admin` CLI; SDK with WebCrypto key handling, outbox, and the
   `localStorage` + `idb-keyval` adapters; Helm chart and scratch image.
   One of your PWAs runs on it for real.
-- **Milestone 2 — make it operable and pleasant.** Change feed + SSE,
+- **Milestone 2 — make it operable and pleasant.** Optional email enrollment
+  (peppered per-app handles, verification round-trip, quota tiers, SMTP),
+  change feed + SSE,
   batching and chunking, service-worker background sync, Dexie adapter,
   recovery-phrase and sync-status UI kit, management UI, `quiesce` +
   scheduled scrub (checksums *and* cleartext-invariant re-validation),
@@ -944,27 +1036,32 @@ just work, not redesign. That's the whole point of freezing the format first.
    flow, but it's a real product decision.
 3. **CRDT in the box?** Should the SDK bundle Yjs helpers, or stay
    merge-agnostic and document the pattern?
-4. **Earned-quota curve**: what do accounts start with and how fast does it
-   grow? Too tight annoys real users on day one; too loose makes Sybil
-   accounts worth creating. Needs a number, not a principle.
-5. **Admin UI exposure in k8s**: is `port-forward` to a ClusterIP Service
+4. **Earned-quota curve and tiers**: what does an anonymous account start
+   with, how fast does it grow, and how much more does an email-verified one
+   get? Too tight annoys real users on day one; too loose makes Sybil accounts
+   worth creating. Needs numbers, not principles.
+5. **Email: dedup only, or contact too?** Hash-only keeps the database boring
+   but means you can never warn anyone; retaining addresses enables notices
+   and puts PII in every snapshot. Which apps, if any, are worth the second
+   option?
+6. **Admin UI exposure in k8s**: is `port-forward` to a ClusterIP Service
    enough, or does the UI need its own Ingress with a public login
    (→ TOTP earlier in the roadmap)?
-6. **Show-once recovery phrase**: acceptable (the price of never persisting
+7. **Show-once recovery phrase**: acceptable (the price of never persisting
    extractable key material), or do apps need PIN-protected re-display?
-7. **Which adapters first?** Ordering `localStorage`, `idb-keyval`, Dexie and
+8. **Which adapters first?** Ordering `localStorage`, `idb-keyval`, Dexie and
    raw IndexedDB depends on what your existing PWAs actually use — worth
    listing them before milestone 1.
-8. **Cache adapter timing**: it's in the format from day one either way —
+9. **Cache adapter timing**: it's in the format from day one either way —
    does one of your apps need the bigger-than-the-browser mode implemented
    early, or is full replication enough to start?
-9. **Storage class**: which block-backed RWO class does your cluster have?
+10. **Storage class**: which block-backed RWO class does your cluster have?
    The chart's defaults and its refuse-RWX guard should match reality.
-10. **Sharing between users**: the format supports it (rewrap a content key to
+11. **Sharing between users**: the format supports it (rewrap a content key to
     a recipient's X25519 key), but the *UX* — how one user names another
     without the server holding an address book — is unsolved, and it's worth
     deciding before it gets built rather than after.
-11. **Legal review, once** — and now clearly needed, since the users are the
+12. **Legal review, once** — and now clearly needed, since the users are the
     general public rather than people you know: the cleartext invariant, the
     takedown flow, the app operator agreement and the transparency note are
     the design's answer to operator exposure, but the specifics (Swiss
@@ -972,6 +1069,6 @@ just work, not redesign. That's the whole point of freezing the format first.
     look like, whether the developer or you is the data controller) want a
     lawyer's read before the service holds strangers' data. Worth doing
     before milestone 1 ships publicly, not after.
-12. **Management UI also needs an abuse workflow**, not just quotas: notice
+13. **Management UI also needs an abuse workflow**, not just quotas: notice
     intake, freeze, purge, and the audit trail as first-class screens. Should
     that be in milestone 2 with the rest of the UI, or earlier?
