@@ -41,8 +41,10 @@ Keeping the server ignorant does a lot of work:
 - The biggest abuse vector disappears structurally: there are **no public,
   unauthenticated reads**. Data can only be fetched by the identity that
   wrote it, so the service is useless as a malware CDN, piracy host, or
-  image-sharing dump. What's left (quota exhaustion, bot signups) is handled
-  by policy — see [Abuse protection](#abuse-protection).
+  image-sharing dump. What's left (quota exhaustion, bot signups by anonymous
+  users) is handled by policy — see
+  [Trust model](#trust-model-vetted-apps-anonymous-users) and
+  [Abuse protection](#abuse-protection).
 
 ```
  ┌──────────────── browser ────────────────┐      ┌──── your k8s cluster ────┐
@@ -203,7 +205,7 @@ by the SDK. This keeps memory bounded and quotas honest.
 ## API sketch
 
 ```
-POST   /v1/register                      {pubkey, inviteCode?, pow?}
+POST   /v1/register                      {pubkey, appId, pow, devSig?}
 POST   /v1/auth/challenge                → {nonce}
 POST   /v1/auth/token                    {pubkey, signature} → {token, ttl}
 
@@ -219,8 +221,8 @@ DELETE /v1/account                       (signed; full erasure)
 
 Admin endpoints live on a separate listener and back the
 [management UI](#management-ui): list accounts by usage, adjust quotas, mint
-invite codes, freeze/delete accounts. The admin sees sizes and timestamps,
-never plaintext.
+app pools, freeze/delete accounts and apps. The admin sees sizes and
+timestamps, never plaintext.
 
 ## Never storing cleartext — the operator's position
 
@@ -318,11 +320,13 @@ is what you'd hand to anyone asking.
   log of those actions. The ability to respond to notice is generally what
   keeps a host in the "conduit, not publisher" position; being unable to read
   content doesn't undermine that, but being unable to *act* would.
-- **Gated registration is a liability control too.** Invite-only means users
-  reach you through an identifiable chain rather than anonymously — you're a
-  private store for known people, not a public anonymous upload host. That's a
-  materially different posture, and it's another reason to keep invites the
-  default.
+- **Your users are the public, not your friends.** The apps are vetted; the
+  people storing data in them are anonymous strangers — see
+  [Trust model](#trust-model-vetted-apps-anonymous-users). So none of the
+  comfort of "private store for known people" applies, and the design leans
+  instead on controls that work without knowing anyone: the cleartext
+  invariant, no public read path, per-app accountability with a named
+  developer behind each app, and a takedown flow that works on notice.
 - **Sharing changes the analysis — flag it now.** The moment user-to-user
   sharing lands, the service starts to *distribute* rather than merely store,
   which is a different legal question. So sharing stays off by default and
@@ -333,6 +337,52 @@ is what you'd hand to anyone asking.
   retention. Extensive IP logging is itself a privacy liability; the default
   should be minimal and documented.
 
+## Trust model: vetted apps, anonymous users
+
+Getting this boundary right changes several earlier assumptions, so it's worth
+stating plainly:
+
+- **Apps are vetted.** Their developers are people you know. Registering an
+  `appId` is a deliberate act by you, the operator.
+- **Users are the public.** Anyone who opens a friend's PWA can create an
+  account. They're anonymous by design — no email, no password, just a
+  keypair. You will never know who they are, and cannot.
+
+So **invite codes gate apps, not users**, and the earlier "invite chain makes
+users identifiable" argument does not survive: from the users' side this is a
+public service, and it should be designed as one.
+
+The awkward part is that **a PWA holds no secrets**. Anything embedded in a
+client-side app — including a registration credential — is public the moment
+it ships. There is therefore no way for an app to authenticate its users to
+the server that a stranger could not replay. That's not a flaw to fix; it's a
+constraint to design around.
+
+The design's answer is to make the **app the unit of accountability** rather
+than the user:
+
+- Each registered app has a **pool**: total bytes, total accounts, and an
+  account-creation rate. Users draw from their app's pool. If an app is
+  abused or goes unexpectedly viral, the blast radius is that pool, and the
+  operator has one conversation with one person they actually know.
+- Every account records **which app registered it, and when** — so an abuse
+  report resolves to an app, and an app resolves to a developer with a
+  contact address in the registry.
+- Each app has a **kill switch**: freeze registrations, freeze writes, or
+  freeze the whole namespace, independently of other apps.
+- An **app operator agreement** (short, plain) with each developer friend:
+  they present terms to their users, they name an abuse contact, they respond
+  when you forward something. This is the human half of the technical
+  controls, and with anonymous end users it's the part that actually
+  distributes responsibility.
+
+**The alternative worth weighing**: if hosting anonymous members of the public
+turns out to be more exposure than you want, the other model is to hand each
+friend the Helm chart and let them run their own instance — you keep the
+software, they keep the users. The design supports both; this is a decision
+about appetite, not architecture, and it's easier to make now than after the
+first app has a thousand users.
+
 ## Abuse protection
 
 Layered, cheapest defense first:
@@ -341,40 +391,59 @@ Layered, cheapest defense first:
    or served anonymously, so the classic "free file host" abuse is impossible
    rather than merely forbidden.
 
-2. **Gated registration** (default: invite codes). The operator mints codes
-   (single- or multi-use, optionally with a quota attached); apps can embed a
-   registration link or the user pastes a code. For friends-and-family or
-   per-community hosting this alone kills bot signups.
-   *Optional open mode* for public apps: registration requires a proof-of-work
-   stamp (a few seconds of client CPU) + per-IP rate limit + a small starter
-   quota. PoW doesn't stop a determined abuser, but combined with quotas it
-   makes abuse cost more than it yields.
+2. **App gating** (invite codes, but for developers). The operator mints codes
+   or simply registers `appId`s directly; unknown app or wrong origin →
+   rejected. An origin check isn't a security boundary against non-browser
+   clients, but it stops drive-by use of your server by strangers' apps.
 
-3. **Hard quotas per identity**: bytes stored (default e.g. 100 MB), record
-   count, and requests/day (token bucket). Ciphertext size is trivially
-   accountable. `413`/`429` with clear errors the SDK surfaces to the app.
+3. **User registration is open but expensive.** Since apps can't authenticate
+   their users, registration cost is the control:
+   - **Proof of work** — a few seconds of client CPU, invisible during a
+     normal onboarding, unpleasant at scale.
+   - **Per-IP and per-app creation rate limits**, with the app's pool as the
+     hard ceiling.
+   - **Earned quota**: accounts start small (a few MB) and grow with age and
+     genuine use. An abuser gets a fleet of near-useless accounts; a real
+     user never notices. This is the single most effective knob, because it
+     makes Sybil accounts worthless rather than merely costly.
+   - **Optional developer-signed registration** for apps that *do* have a
+     backend or their own invite system: the registry entry carries the
+     developer's public key, and registrations must be signed by it. Not
+     available to purely serverless PWAs, hence optional.
 
-4. **Per-app registry**: the server carries an allowlist of known `appId`s
-   with their CORS origins and per-app default quotas. Unknown app or wrong
-   origin → rejected. (An origin check is not a security boundary against
-   non-browser clients, but it stops drive-by use of your server by strangers'
-   apps.)
+4. **Hard quotas per identity** *and* per app: bytes stored, record count,
+   requests/day (token bucket). Ciphertext size is trivially accountable.
+   `413`/`429` with clear errors the SDK surfaces to the app.
 
 5. **Blob/size/rate caps**: max blob size, max keys per app, bounded request
    body handling, global connection limits — standard hygiene.
 
-6. **Cleartext refused at the door**: not an abuse control as such, but it is
+6. **Global guardrails**: a cluster-wide storage ceiling with alerting well
+   before the PVC fills, since with anonymous signup total exposure is
+   accounts × quota rather than a number you chose directly.
+
+7. **Cleartext refused at the door**: not an abuse control as such, but it is
    what keeps the operator out of possession of readable content — see
    [Never storing cleartext](#never-storing-cleartext--the-operators-position).
 
-7. **Operator tools, not surveillance**: usage dashboards, top-accounts view,
-   freeze/purge, abuse contact and takedown flow — all metadata-only, all
-   audit-logged.
+8. **Operator tools, not surveillance**: usage dashboards, top accounts and
+   top apps, freeze/purge, abuse contact and takedown flow — all
+   metadata-only, all audit-logged.
 
-Explicitly **off by default**: inactivity expiry. "Permanent" means permanent;
-an operator who wants an expiry policy (e.g. purge accounts untouched for
-3 years after email-less best-effort warning via the app) can opt in, but the
-promise to users should be the strong one.
+**Expiry, revisited for anonymous users.** "Permanent" stays the promise for
+accounts holding real data — with no email there is no way to warn anyone, so
+deleting their data is not something to do casually. But anonymous public
+signup produces a *lot* of junk: accounts created by a curious visitor who
+never stored anything, or who cleared their browser the same day. So the
+policy splits:
+
+- **Empty accounts** (registered, never stored a record) expire after ~30
+  days. No data is lost by definition, and this absorbs most of the noise.
+- **Accounts with data are permanent**, unless the operator opts into a
+  long-horizon policy knowingly.
+
+That keeps the strong promise where it means something without accumulating
+unbounded debris from anonymous registration.
 
 ## Implementation: Rust workspace
 
@@ -407,7 +476,8 @@ fallback on older browsers, and nothing else. That drops the SDK from
 - **axum + tokio + tower**; rate limiting and body limits as tower layers
   (`tower_governor` for token buckets per identity and per IP).
 - **SQLite via sqlx** (compile-time checked queries) in WAL mode for all
-  metadata: accounts, quotas, versions, cursors, invite codes, audit log.
+  metadata: accounts, app registry and pools, quotas, versions, cursors,
+  audit log.
   Blobs ≤ ~64 KB inline in SQLite; larger ones as files in a
   content-addressed directory (BLAKE3 names double as checksums). Database and
   blob directory **must share one volume** so volume snapshots are atomic
@@ -581,13 +651,17 @@ Operator-facing, and planned in from the start rather than bolted on. It is
   usage, quota pressure, backup and scrub status.
 - **Accounts**: search by user id, per-app usage breakdown (sizes and
   timestamps only), quota overrides, freeze / unfreeze, delete with
-  confirmation.
-- **Invites**: mint single- or multi-use codes with quota presets, see
-  redemption status, revoke unused codes.
-- **App registry**: add/edit `appId`s, CORS origins, per-app default quotas,
-  per-app usage stats.
-- **Settings**: registration mode (invite-only / open+PoW), PoW difficulty,
-  size and rate limits — the knobs from [Abuse protection](#abuse-protection).
+  confirmation. With anonymous users there is nothing else to search *by* —
+  no names, no emails, by design.
+- **Apps**: register `appId`s, their developer contact, CORS origins, and
+  **pools** (total bytes, account count, creation rate) with live consumption
+  against each — plus the per-app kill switch (freeze registrations, freeze
+  writes, freeze everything).
+- **Accounts by provenance**: which app registered an account and when, so an
+  abuse report resolves to an app and then to a person you can call.
+- **Settings**: PoW difficulty, earned-quota curve, per-IP and per-app
+  creation limits, size and rate limits, global storage ceiling — the knobs
+  from [Abuse protection](#abuse-protection).
 - **Abuse handling**: notice intake, per-account and per-record freeze and
   purge, and the resulting audit entries — the operator-facing half of
   [never storing cleartext](#never-storing-cleartext--the-operators-position).
@@ -835,7 +909,8 @@ ergonomics only become clear once a second device is syncing. So:
 
 - **Milestone 1 — format frozen, thin vertical slice.** `krptk-format` and
   `krptk-crypto` complete with test vectors; server with
-  register/auth/KV/CAS/quotas/invite codes, the cleartext-refusal invariant
+  register/auth/KV/CAS, per-app pools and earned quota, PoW registration, the
+  cleartext-refusal invariant
   (positive validation, entropy check, opaque key names, no-render response
   headers); `krptk admin` CLI; SDK with WebCrypto key handling, outbox, and the
   `localStorage` + `idb-keyval` adapters; Helm chart and scratch image.
@@ -857,8 +932,11 @@ just work, not redesign. That's the whole point of freezing the format first.
 
 ## Open questions
 
-1. **Registration UX vs. abuse**: are invite codes acceptable for your apps'
-   audiences, or do some apps need open signup (→ PoW + starter quota mode)?
+1. **Hosting the public, or not**: are you comfortable being the operator of
+   record for anonymous users of your friends' apps, or would you rather ship
+   each friend their own instance? This is the biggest open question in the
+   document and everything about exposure follows from it — see
+   [Trust model](#trust-model-vetted-apps-anonymous-users).
 2. **Key custody UX**: is a mandatory recovery phrase acceptable, or do some
    apps need an easier (weaker) mode, e.g. passphrase-encrypted seed stored
    server-side? That reintroduces password UX and weakens zero-knowledge —
@@ -866,9 +944,9 @@ just work, not redesign. That's the whole point of freezing the format first.
    flow, but it's a real product decision.
 3. **CRDT in the box?** Should the SDK bundle Yjs helpers, or stay
    merge-agnostic and document the pattern?
-4. **Multi-tenancy**: one krptk instance for all your apps and all their
-   users, or per-community instances? The design supports both; quotas and
-   invite policy are where they differ.
+4. **Earned-quota curve**: what do accounts start with and how fast does it
+   grow? Too tight annoys real users on day one; too loose makes Sybil
+   accounts worth creating. Needs a number, not a principle.
 5. **Admin UI exposure in k8s**: is `port-forward` to a ClusterIP Service
    enough, or does the UI need its own Ingress with a public login
    (→ TOTP earlier in the roadmap)?
@@ -886,12 +964,14 @@ just work, not redesign. That's the whole point of freezing the format first.
     a recipient's X25519 key), but the *UX* — how one user names another
     without the server holding an address book — is unsolved, and it's worth
     deciding before it gets built rather than after.
-11. **Legal review, once**: the cleartext invariant, the takedown flow and the
-    transparency note are the design's answer to operator exposure, but the
-    specifics (Swiss hosting-provider duties, what retention is expected, what
-    an abuse contact must look like) want a lawyer's read before the service
-    holds anyone else's data. Worth doing before milestone 1 ships publicly,
-    not after.
+11. **Legal review, once** — and now clearly needed, since the users are the
+    general public rather than people you know: the cleartext invariant, the
+    takedown flow, the app operator agreement and the transparency note are
+    the design's answer to operator exposure, but the specifics (Swiss
+    hosting-provider duties, expected retention, what an abuse contact must
+    look like, whether the developer or you is the data controller) want a
+    lawyer's read before the service holds strangers' data. Worth doing
+    before milestone 1 ships publicly, not after.
 12. **Management UI also needs an abuse workflow**, not just quotas: notice
     intake, freeze, purge, and the audit trail as first-class screens. Should
     that be in milestone 2 with the rest of the UI, or earlier?
