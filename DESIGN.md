@@ -217,7 +217,7 @@ DELETE /v1/apps/{app}/kv/{key}           If-Version: N
 GET    /v1/apps/{app}/kv?since=<cursor>  → change list (keys, versions, sizes)
 GET    /v1/apps/{app}/events             SSE change notifications
 
-GET    /v1/account                       → usage, quota, app list
+GET    /v1/account                       → usage, quota, tier, app list, notices
 DELETE /v1/account                       (signed; full erasure)
 ```
 
@@ -338,6 +338,10 @@ is what you'd hand to anyone asking.
   lawful request (account creation time, quota usage, action audit) with short
   retention. Extensive IP logging is itself a privacy liability; the default
   should be minimal and documented.
+- **No contactable personal data at rest**, by decision: email enrollment
+  keeps only a peppered per-app handle and discards the address — see
+  [Optional email enrollment](#optional-email-enrollment). So a database or
+  snapshot disclosure exposes no addresses, and erasure is a row delete.
 
 ## Trust model: vetted apps, anonymous users
 
@@ -391,22 +395,17 @@ Asking users to enroll with an email and keeping only a hash is a good
 instinct, and it fits the earned-quota model well — but two things need to be
 right, and the first one decides whether it does what you want at all.
 
-**A hash cannot be contacted.** If the server stores only `H(email)`, it can
-check uniqueness but can never send anything. So decide which goal is being
-bought:
+**Decision: the address is never stored.** A hash can be compared but not
+contacted, so email buys exactly one thing here — uniqueness — and that is the
+thing worth having. Retaining addresses in order to notify users would put
+personal data into the database, every volume snapshot and every offsite copy,
+in exchange for a notification channel that in-app notices cover well enough
+(see below). So the address is used once, during verification, and discarded.
 
-| Goal | Needs | Cost |
-|---|---|---|
-| Sybil resistance / dedup | peppered hash only | low — no address retained |
-| Notifying users (expiry warnings, security notices, "save your phrase") | the **address itself**, retained | real PII in the database, in every snapshot, and in every offsite copy |
-
-Those are different features. Storing addresses to enable warnings puts
-personal data into exactly the backups you were keeping clean; hash-only keeps
-the database boring but means you still cannot warn anyone before an empty
-account expires. My recommendation is **hash-only by default**, with address
-retention as a per-app opt-in for apps that genuinely want to notify their
-users — and when retained, encrypted under a key held outside the database so
-a snapshot alone doesn't disclose it.
+The upside of that ruling is larger than it looks: **the server holds no
+contactable personal data at all**, which keeps the snapshots boring, keeps
+erasure trivial (delete the account row and the handle is gone), and keeps the
+transparency note short.
 
 **A plain hash of an email is not anonymization.** The address space is small
 and enumerable; hashed email dumps get reversed routinely, and data-protection
@@ -457,10 +456,20 @@ worth doing if the accounts are worth something.
    say so plainly, or email enrollment will actively *worsen* the number of
    people who lose their data by making them feel safe.
 
-**The costs, stated:** running SMTP for a self-hosted service is a genuine
-operational burden (deliverability, SPF/DKIM, bounces, spam complaints);
-disposable-address domains make dedup a treadmill rather than a solution; and
-verification adds a step to onboarding that some apps won't want. Privacy
+**Replacing the notification channel: in-app notices.** Since nobody can be
+emailed, operator-to-user messages ride the API instead. `/v1/account` carries
+a `notices` list (quota nearly full, app frozen, planned maintenance,
+"you still haven't confirmed you saved your recovery phrase"), the SDK exposes
+it, and the app shows it on next open. Not suitable for anything urgent or for
+reaching someone who never returns — but those are precisely the cases where
+holding an address wouldn't have helped much either.
+
+**The costs, stated:** SMTP is still needed, though only for the one
+transactional verification mail — no lists, no bounce handling, no unsubscribe
+machinery, which is the cheap end of running mail (still SPF/DKIM and
+deliverability care). Disposable-address domains make dedup a treadmill rather
+than a solution; and verification adds a step to onboarding that some apps
+won't want. Privacy
 Pass / Private Access Tokens are the emerging way to get anonymous rate
 limiting without any identifier at all, but support is uneven — worth watching
 rather than building on today.
@@ -524,10 +533,10 @@ policy splits:
 
 - **Empty accounts** (registered, never stored a record) expire after ~30
   days. No data is lost by definition, and this absorbs most of the noise.
-- **Accounts with data are permanent**, unless the operator opts into a
-  long-horizon policy knowingly — and note that such a policy only becomes
-  defensible for apps that retain addresses, since otherwise there is nobody
-  to warn. See [Optional email enrollment](#optional-email-enrollment).
+- **Accounts with data are permanent, unconditionally.** Since no addresses
+  are stored, there is no way to warn anyone before deleting their data — so
+  the inactivity-expiry knob is dropped rather than made configurable. A
+  policy you cannot announce is not a policy you should have.
 
 That keeps the strong promise where it means something without accumulating
 unbounded debris from anonymous registration.
@@ -640,8 +649,8 @@ Consequences worth planning for rather than discovering:
   `RuntimeDefault`.
 - **Config and secrets**: TOML config from a ConfigMap with a checksum
   annotation so config changes roll the pod; session signing key, operator
-  bootstrap credentials, SMTP credentials and the **email pepper** from a
-  Secret (External Secrets-friendly). The pepper must live outside the PVC so
+  bootstrap credentials, SMTP credentials (verification mail only) and the
+  **email pepper** from a Secret (External Secrets-friendly). The pepper must live outside the PVC so
   that a leaked volume snapshot cannot be used to enumerate email handles —
   which means it also needs its own backup, separate from the volume ones.
 - **Observability**: optional `ServiceMonitor` for Prometheus Operator, and
@@ -752,6 +761,8 @@ Operator-facing, and planned in from the start rather than bolted on. It is
   quota tiers, per-IP and per-app creation limits, size and rate limits,
   global storage ceiling — the knobs from
   [Abuse protection](#abuse-protection).
+- **User notices**: compose the in-app messages an account sees on next
+  open — the only channel to users, since no addresses are stored.
 - **Abuse handling**: notice intake, per-account and per-record freeze and
   purge, and the resulting audit entries — the operator-facing half of
   [never storing cleartext](#never-storing-cleartext--the-operators-position).
@@ -919,7 +930,9 @@ small stores keep the simple fully-replicated behavior.
 - **Batching**: many small records coalesce into one encrypted batch blob —
   keeps request counts, per-record overhead and quota consumption sane.
 - **Status model** exposed for UI: `synced | pending | offline | conflict |
-  quota-exceeded | partial | not-linked`. Ships with a tiny sync-status indicator and
+  quota-exceeded | partial | not-linked`, plus any operator `notices` from
+  `/v1/account` — the only channel to users, since the server stores no
+  addresses. Ships with a tiny sync-status indicator and
   the recovery-phrase onboarding flow, since every app needs both.
 - **Explicit allowlist, never "sync everything"**: apps name the prefixes,
   stores and tables to replicate, so caches and derived data don't burn user
@@ -1040,28 +1053,24 @@ just work, not redesign. That's the whole point of freezing the format first.
    with, how fast does it grow, and how much more does an email-verified one
    get? Too tight annoys real users on day one; too loose makes Sybil accounts
    worth creating. Needs numbers, not principles.
-5. **Email: dedup only, or contact too?** Hash-only keeps the database boring
-   but means you can never warn anyone; retaining addresses enables notices
-   and puts PII in every snapshot. Which apps, if any, are worth the second
-   option?
-6. **Admin UI exposure in k8s**: is `port-forward` to a ClusterIP Service
+5. **Admin UI exposure in k8s**: is `port-forward` to a ClusterIP Service
    enough, or does the UI need its own Ingress with a public login
    (→ TOTP earlier in the roadmap)?
-7. **Show-once recovery phrase**: acceptable (the price of never persisting
+6. **Show-once recovery phrase**: acceptable (the price of never persisting
    extractable key material), or do apps need PIN-protected re-display?
-8. **Which adapters first?** Ordering `localStorage`, `idb-keyval`, Dexie and
+7. **Which adapters first?** Ordering `localStorage`, `idb-keyval`, Dexie and
    raw IndexedDB depends on what your existing PWAs actually use — worth
    listing them before milestone 1.
-9. **Cache adapter timing**: it's in the format from day one either way —
+8. **Cache adapter timing**: it's in the format from day one either way —
    does one of your apps need the bigger-than-the-browser mode implemented
    early, or is full replication enough to start?
-10. **Storage class**: which block-backed RWO class does your cluster have?
+9. **Storage class**: which block-backed RWO class does your cluster have?
    The chart's defaults and its refuse-RWX guard should match reality.
-11. **Sharing between users**: the format supports it (rewrap a content key to
+10. **Sharing between users**: the format supports it (rewrap a content key to
     a recipient's X25519 key), but the *UX* — how one user names another
     without the server holding an address book — is unsolved, and it's worth
     deciding before it gets built rather than after.
-12. **Legal review, once** — and now clearly needed, since the users are the
+11. **Legal review, once** — and now clearly needed, since the users are the
     general public rather than people you know: the cleartext invariant, the
     takedown flow, the app operator agreement and the transparency note are
     the design's answer to operator exposure, but the specifics (Swiss
@@ -1069,6 +1078,6 @@ just work, not redesign. That's the whole point of freezing the format first.
     look like, whether the developer or you is the data controller) want a
     lawyer's read before the service holds strangers' data. Worth doing
     before milestone 1 ships publicly, not after.
-13. **Management UI also needs an abuse workflow**, not just quotas: notice
+12. **Management UI also needs an abuse workflow**, not just quotas: notice
     intake, freeze, purge, and the audit trail as first-class screens. Should
     that be in milestone 2 with the rest of the UI, or earlier?
